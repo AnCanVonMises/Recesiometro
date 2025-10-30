@@ -3,13 +3,14 @@ import pandas as pd
 import numpy as np
 from fredapi import Fred
 import requests
+import plotly.express as px
+from datetime import datetime
 
 # =========================
-# CONFIG STREAMLIT
+# CONFIGURACIÓN
 # =========================
-st.set_page_config(page_title="📊 Global Recession Meter", layout="wide")
-st.markdown("<h1 style='text-align:center; color:#1f77b4;'>📊 Global Recession Meter</h1>", unsafe_allow_html=True)
-st.markdown("<h4 style='text-align:center; color:#555;'>Predicting recession risk using yield curve and macroeconomic indicators</h4>", unsafe_allow_html=True)
+st.set_page_config(page_title="📊 Recesiómetro IA", layout="wide")
+st.markdown("<h1 style='text-align:center; color:#1f77b4;'>📊 Recesiómetro IA</h1>", unsafe_allow_html=True)
 
 # =========================
 # API KEYS
@@ -20,57 +21,48 @@ GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 fred = Fred(api_key=FRED_API_KEY)
 
 # =========================
-# INDICADORES FRED USA
+# INDICADORES CLAVE
 # =========================
-codes = {
-    "USA": {
-        "Real GDP": "GDPC1",
-        "Unemployment": "UNRATE",
-        "CPI": "CPIAUCSL",
-        "Industrial Production": "INDPRO",
-        "Retail Sales": "RSAFS",
-        "10-Year Rate": "GS10", 
-        "3-Month Rate": "TB3MS",
-        "Consumer Confidence": "UMCSENT",
-        "Nonfarm Payrolls": "PAYEMS",
-        "Building Permits": "PERMIT",
-        "S&P 500": "SP500",
-        "WTI Oil": "DCOILWTICO",
-        "30Y Fixed Mortgage": "MORTGAGE30US",
-        "Mortgage Delinquencies": "QBPAMISM",
-        "Personal Consumption Expenditure": "PCE",
-        "Personal Income": "PI",
-        "Durable Goods Orders": "DGORDER",
-        "ISM Manufacturing": "NAPM",
-        "ISM Services": "SERVPMI",
-        "M2 Money Supply": "M2SL",
-        "Corporate Profits": "CP"
-    }
+key_indicators = {
+    "Real GDP": "GDPC1",
+    "Unemployment": "UNRATE",
+    "CPI": "CPIAUCSL",
+    "Industrial Production": "INDPRO",
+    "Yield Curve (10y-3m)": ["GS10", "TB3MS"],
+    "Consumer Confidence": "UMCSENT"
 }
 
+# =========================
+# DESCARGA DE DATOS
+# =========================
+df = pd.DataFrame()
+
+for name, code in key_indicators.items():
+    try:
+        if isinstance(code, list):
+            # Yield curve
+            df["10Y"] = fred.get_series(code[0])
+            df["3M"] = fred.get_series(code[1])
+            df["Yield Curve (10y-3m)"] = df["10Y"] - df["3M"]
+        else:
+            serie = fred.get_series(code)
+            df[name] = serie
+    except:
+        st.warning(f"No disponible: {name}")
+
+df = df.asfreq('D').interpolate(method='linear')
+df.sort_index(inplace=True)
+
+# =========================
+# CÁLCULO RIESGO SIMPLE
+# =========================
 weights = {
     "Yield Curve (10y-3m)": 35,
     "Real GDP": 30,
     "Unemployment": 30,
     "CPI": 25,
     "Industrial Production": 15,
-    "Retail Sales": 15,
-    "10-Year Rate": 5,
-    "3-Month Rate": 5,
-    "Consumer Confidence": 10,
-    "Nonfarm Payrolls": 15,
-    "Building Permits": 5,
-    "S&P 500": 10,
-    "WTI Oil": 5,
-    "30Y Fixed Mortgage": 5,
-    "Mortgage Delinquencies": 10,
-    "Personal Consumption Expenditure": 10,
-    "Personal Income": 10,
-    "Durable Goods Orders": 10,
-    "ISM Manufacturing": 15,
-    "ISM Services": 15,
-    "M2 Money Supply": 5,
-    "Corporate Profits": 15
+    "Consumer Confidence": 10
 }
 
 risk_direction = {
@@ -79,124 +71,88 @@ risk_direction = {
     "Unemployment": True,
     "CPI": True,
     "Industrial Production": False,
-    "Retail Sales": False,
-    "10-Year Rate": True,
-    "3-Month Rate": True,
-    "Consumer Confidence": False,
-    "Nonfarm Payrolls": False,
-    "Building Permits": False,
-    "S&P 500": False,
-    "WTI Oil": False,
-    "30Y Fixed Mortgage": True,
-    "Mortgage Delinquencies": True,
-    "Personal Consumption Expenditure": False,
-    "Personal Income": False,
-    "Durable Goods Orders": False,
-    "ISM Manufacturing": False,
-    "ISM Services": False,
-    "M2 Money Supply": False,
-    "Corporate Profits": False
+    "Consumer Confidence": False
 }
 
-# =========================
-# SELECCION DE PAISES
-# =========================
-selected_countries = st.multiselect(
-    "Select countries",
-    options=list(codes.keys()),
-    default=["USA"]
-)
-if not selected_countries:
-    st.stop()
+df_risk = df.copy()
+df_risk = df_risk.ffill()
+risk = pd.Series(index=df_risk.index, dtype=float)
+pct_change = df_risk.pct_change().fillna(0)
+
+for date in df_risk.index:
+    value = 0
+    for var in weights.keys():
+        if var not in df_risk.columns:
+            continue
+        change = pct_change.loc[date, var]
+        if not risk_direction[var]:
+            change = -change
+        change = np.clip(change, -0.2, 0.2)
+        value += change * weights[var]
+    # Penalización yield curve invertida
+    if "Yield Curve (10y-3m)" in df_risk.columns and df_risk.loc[date, "Yield Curve (10y-3m)"] < 0:
+        value += weights["Yield Curve (10y-3m)"] * 0.5
+    risk[date] = max(0, min(100, value))
+
+df_risk["Risk (%)"] = risk
 
 # =========================
-# DESCARGA DE DATOS
+# EVENTOS CLAVE (cuando aumenta riesgo >5% en un periodo)
 # =========================
-all_data = {}
-for country in selected_countries:
-    indicators = codes[country]
-    df_country = pd.DataFrame()
-    for name, code in indicators.items():
-        try:
-            serie = fred.get_series(code)
-            serie.index = pd.to_datetime(serie.index)
-            df_country[name] = serie
-        except Exception:
-            st.warning(f"⚠️ Not available: {name} ({code}) in {country}")
-
-    if not df_country.empty:
-        df_country = df_country.asfreq('D').interpolate(method='linear')
-        if "CPI" in df_country.columns:
-            df_country["Annual Inflation (%)"] = df_country["CPI"].pct_change(365) * 100
-        if {"10-Year Rate", "3-Month Rate"} <= set(df_country.columns):
-            df_country["Yield Curve (10y-3m)"] = df_country["10-Year Rate"] - df_country["3-Month Rate"]
-        df_country.sort_index(inplace=True)
-        all_data[country] = df_country
+df_risk["Delta"] = df_risk["Risk (%)"].diff()
+events = df_risk[df_risk["Delta"] > 5]
 
 # =========================
-# CALCULO DE RIESGO
+# GRAFICA
 # =========================
-def calculate_risk_advanced(df):
-    df = df.ffill()
-    risk = pd.Series(index=df.index, dtype=float)
-    pct_change = df.pct_change().fillna(0)
-
-    for date in df.index:
-        value = 0
-        for var in codes["USA"]:
-            if var not in df.columns:
-                continue
-            change = pct_change.loc[date, var]
-            if not risk_direction[var]:
-                change = -change
-            change = np.clip(change, -0.2, 0.2)
-            value += change * weights[var]
-        if "Yield Curve (10y-3m)" in df.columns and df.loc[date, "Yield Curve (10y-3m)"] < 0:
-            value += weights["Yield Curve (10y-3m)"] * 0.5
-        risk[date] = max(0, min(100, value))
-    df["Risk (%)"] = risk
-    return df
+fig = px.line(df_risk, y="Risk (%)", title="Riesgo de Recesión (%)")
+for i, row in events.iterrows():
+    fig.add_annotation(
+        x=i,
+        y=row["Risk (%)"],
+        text="⬆ Evento clave",
+        showarrow=True,
+        arrowhead=2,
+        ax=0,
+        ay=-40,
+        bgcolor="yellow"
+    )
+st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# FUNCION IA / GROQ
+# EXPLICACION IA
 # =========================
 def explain_risk_with_llm(risk_value, context_vars):
     prompt = f"""
 Eres un analista siguiendo los principios de Ray Dalio.
-Riesgo de recesión calculado: {risk_value:.1f}%
-Variables recientes:
+Riesgo de recesión actual: {risk_value:.1f}%
+Indicadores recientes:
 {context_vars}
 
-Responde en este formato:
-- Porcentaje de riesgo: X%
-- Explicación: breve, clara y estilo Ray Dalio
+Proporciona una explicación detallada de por qué el riesgo es así, en qué se basa y cuál es el porcentaje actual de riesgo de recesión.
+Responde en texto plano.
 """
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     payload = {
         "model": "llama3-70b-8192",
         "prompt": prompt,
-        "max_tokens": 256,
+        "max_tokens": 300,
         "temperature": 0.7
     }
     try:
         response = requests.post("https://api.groq.com/openai/v1/completions", headers=headers, json=payload)
-        return response.json()["choices"][0]["text"]
+        if "text" in response.json():
+            return response.json()["text"]
+        else:
+            return response.text
     except Exception as e:
         return f"⚠️ AI error: {e}"
 
-# =========================
-# DISPLAY
-# =========================
-for country, df in all_data.items():
-    df = calculate_risk_advanced(df)
-    st.subheader(f"{country} Risk Index")
-    st.line_chart(df["Risk (%)"])
+latest_risk = df_risk["Risk (%)"].iloc[-1]
+context_vars = df_risk.tail(1).to_dict(orient="records")[0]
+explanation = explain_risk_with_llm(latest_risk, context_vars)
 
-    latest_risk = df["Risk (%)"].iloc[-1]
-    context_vars = df.tail(1).to_dict(orient="records")[0]
+st.markdown("###  Evaluación de Riesgo (IA)")
+st.write(explanation)
+st.markdown(f"**Riesgo de recesión al {df_risk.index[-1].date()}: {latest_risk:.1f}%**")
 
-    explanation = explain_risk_with_llm(latest_risk, context_vars)
-
-    st.markdown("### 🤖 AI Risk Assessment")
-    st.write(explanation)
-    st.dataframe(df.tail(10))
